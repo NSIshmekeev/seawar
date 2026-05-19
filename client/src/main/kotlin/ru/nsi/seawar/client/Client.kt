@@ -102,6 +102,7 @@ private data class ClientUiState(
     val enemyBoard: List<List<CellState>> = emptyBoardView().cells,
     val placementHint: String = "Поставьте корабль размером ${defaultFleet.first().size}",
     val placementReady: Boolean = false,
+    val placementGenerating: Boolean = false,
     val fleetSubmitted: Boolean = false,
     val orientation: Orientation = Orientation.Horizontal,
     val opponentName: String? = null,
@@ -112,6 +113,7 @@ private data class PlacementState(
     var orientation: Orientation = Orientation.Horizontal,
     var submitRequested: Boolean = false,
     var submitted: Boolean = false,
+    var generating: Boolean = false,
 ) {
     fun nextShipSize(): Int? = if (placements.size < defaultFleet.size) defaultFleet[placements.size].size else null
 
@@ -269,11 +271,11 @@ private class SeaWarApp {
                     placementLabel.text = ui.placementHint
                     connectButton.text = if (ui.connected) "Отключиться" else "Подключиться"
                     orientationButton.text = if (ui.orientation == Orientation.Horizontal) "Горизонтально" else "Вертикально"
-                    readyButton.isEnabled = ui.placementReady && !ui.fleetSubmitted
-                    randomButton.isEnabled = !ui.fleetSubmitted
-                    clearButton.isEnabled = !ui.fleetSubmitted
-                    orientationButton.isEnabled = !ui.fleetSubmitted
-                    yourGrid.setBoard(ui.yourBoard, locked = ui.fleetSubmitted)
+                    readyButton.isEnabled = ui.placementReady && !ui.fleetSubmitted && !ui.placementGenerating
+                    randomButton.isEnabled = !ui.fleetSubmitted && !ui.placementGenerating
+                    clearButton.isEnabled = !ui.fleetSubmitted && !ui.placementGenerating
+                    orientationButton.isEnabled = !ui.fleetSubmitted && !ui.placementGenerating
+                    yourGrid.setBoard(ui.yourBoard, locked = ui.fleetSubmitted || ui.placementGenerating)
                     enemyGrid.setBoard(ui.enemyBoard, locked = !ui.yourTurn || !ui.fleetSubmitted)
                 }
             }
@@ -353,7 +355,7 @@ private class SeaWarApp {
     }
 
     private fun placeShipAt(cell: Cell) {
-        if (placement.submitted) return
+        if (placement.submitted || placement.generating) return
         val shipSize = placement.nextShipSize() ?: return
         val cells = buildList {
             for (index in 0 until shipSize) {
@@ -401,14 +403,26 @@ private class SeaWarApp {
     }
 
     private fun applyRandomPlacement() {
-        if (placement.submitted) return
-        placement.placements.clear()
-        placement.placements.addAll(autoPlaceFleet())
+        if (placement.submitted || placement.generating) return
+        placement.generating = true
+        placement.submitRequested = false
         updatePlacementUi()
+        scope.launch(Dispatchers.Default) {
+            val generated = generateRandomFleet()
+            if (generated != null) {
+                placement.placements.clear()
+                placement.placements.addAll(generated)
+            }
+            placement.generating = false
+            if (generated == null) {
+                state.update { it.copy(status = "Не удалось подобрать случайную расстановку") }
+            }
+            updatePlacementUi()
+        }
     }
 
     private fun resetPlacement() {
-        if (placement.submitted) return
+        if (placement.submitted || placement.generating) return
         placement.placements.clear()
         placement.submitRequested = false
         updatePlacementUi()
@@ -441,6 +455,7 @@ private class SeaWarApp {
     private fun updatePlacementUi() {
         val nextSize = placement.nextShipSize()
         val hint = when {
+            placement.generating -> "Генерируем случайную расстановку..."
             placement.submitted -> "Флот отправлен. Ожидаем соперника."
             nextSize != null -> "Поставьте корабль размером $nextSize"
             else -> "Флот готов. Нажмите \"Подтвердить флот\"."
@@ -455,7 +470,8 @@ private class SeaWarApp {
             current.copy(
                 yourBoard = board,
                 placementHint = hint,
-                placementReady = placement.isReady(),
+                placementReady = placement.isReady() && !placement.generating,
+                placementGenerating = placement.generating,
                 fleetSubmitted = placement.submitted,
                 orientation = placement.orientation,
             )
@@ -648,11 +664,12 @@ private class BoardPanel(
     }
 }
 
-private fun autoPlaceFleet(): List<ShipPlacement> {
+private fun generateRandomFleet(): List<ShipPlacement>? {
     val random = Random(System.currentTimeMillis())
-    while (true) {
+    repeat(400) {
         val placements = mutableListOf<ShipPlacement>()
         val occupied = mutableSetOf<Cell>()
+        var success = true
         for (ship in defaultFleet) {
             var placed = false
             repeat(200) {
@@ -664,24 +681,70 @@ private fun autoPlaceFleet(): List<ShipPlacement> {
                         add(if (horizontal) Cell(x + index, y) else Cell(x, y + index))
                     }
                 }
-                if (cells.any { it.x !in 0 until BOARD_SIZE || it.y !in 0 until BOARD_SIZE }) return@repeat
-                if (cells.any { it in occupied }) return@repeat
-                if (cells.any { cell -> around(cell).any { it in occupied } }) return@repeat
+                if (!canPlace(cells, occupied)) return@repeat
                 placements += ShipPlacement(cells)
                 occupied += cells
                 placed = true
                 return@repeat
             }
             if (!placed) {
-                placements.clear()
-                occupied.clear()
+                success = false
                 break
             }
         }
-        if (placements.size == defaultFleet.size) {
+        if (success) {
             return placements
         }
     }
+    return generateDeterministicFleet()
+}
+
+private fun generateDeterministicFleet(): List<ShipPlacement>? {
+    val placements = mutableListOf<ShipPlacement>()
+    val occupied = mutableSetOf<Cell>()
+    for ((index, ship) in defaultFleet.withIndex()) {
+        var placed = false
+        val orientationOrder = if (index % 2 == 0) {
+            listOf(Orientation.Horizontal, Orientation.Vertical)
+        } else {
+            listOf(Orientation.Vertical, Orientation.Horizontal)
+        }
+        for (y in 0 until BOARD_SIZE) {
+            for (x in 0 until BOARD_SIZE) {
+                for (orientation in orientationOrder) {
+                    val cells = buildList {
+                        for (offset in 0 until ship.size) {
+                            add(
+                                if (orientation == Orientation.Horizontal) {
+                                    Cell(x + offset, y)
+                                } else {
+                                    Cell(x, y + offset)
+                                }
+                            )
+                        }
+                    }
+                    if (!canPlace(cells, occupied)) continue
+                    placements += ShipPlacement(cells)
+                    occupied += cells
+                    placed = true
+                    break
+                }
+                if (placed) break
+            }
+            if (placed) break
+        }
+        if (!placed) {
+            return null
+        }
+    }
+    return placements
+}
+
+private fun canPlace(cells: List<Cell>, occupied: Set<Cell>): Boolean {
+    if (cells.any { it.x !in 0 until BOARD_SIZE || it.y !in 0 until BOARD_SIZE }) return false
+    if (cells.any { it in occupied }) return false
+    if (cells.any { cell -> around(cell).any { it in occupied } }) return false
+    return true
 }
 
 private fun around(cell: Cell): List<Cell> = buildList {
