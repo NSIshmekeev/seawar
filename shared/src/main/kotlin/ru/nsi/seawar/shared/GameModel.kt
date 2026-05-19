@@ -116,13 +116,14 @@ fun createBoardView(
 
 fun validateFleet(ships: List<ShipPlacement>): Result<Set<Cell>> {
     val allCells = linkedSetOf<Cell>()
+    val cellToShip = mutableMapOf<Cell, Int>()
     val expectedSizes = defaultFleet.map { it.size }.sortedDescending()
     val actualSizes = ships.map { it.cells.size }.sortedDescending()
     if (expectedSizes != actualSizes) {
         return Result.failure(IllegalArgumentException("Нужно разместить флот: ${defaultFleet.joinToString { it.size.toString() }}"))
     }
 
-    for (ship in ships) {
+    ships.forEachIndexed { index, ship ->
         if (ship.cells.isEmpty()) {
             return Result.failure(IllegalArgumentException("Корабль не может быть пустым"))
         }
@@ -151,8 +152,19 @@ fun validateFleet(ships: List<ShipPlacement>): Result<Set<Cell>> {
             if (cell.x !in 0 until BOARD_SIZE || cell.y !in 0 until BOARD_SIZE) {
                 return Result.failure(IllegalArgumentException("Корабль выходит за пределы поля"))
             }
-            if (!allCells.add(cell)) {
+            if (cellToShip.containsKey(cell)) {
                 return Result.failure(IllegalArgumentException("Корабли не могут пересекаться"))
+            }
+            cellToShip[cell] = index
+            allCells.add(cell)
+        }
+    }
+
+    for ((cell, shipIndex) in cellToShip) {
+        for (neighbor in allCellsAround(cell)) {
+            val neighborShip = cellToShip[neighbor]
+            if (neighborShip != null && neighborShip != shipIndex) {
+                return Result.failure(IllegalArgumentException("Корабли не должны касаться"))
             }
         }
     }

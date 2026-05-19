@@ -10,6 +10,7 @@ dependencies {
     implementation("io.ktor:ktor-server-netty-jvm:2.3.12")
     implementation("io.ktor:ktor-server-websockets-jvm:2.3.12")
     implementation("org.jetbrains.kotlinx:kotlinx-serialization-json:1.6.3")
+    runtimeOnly("org.slf4j:slf4j-simple:2.0.13")
     testImplementation(kotlin("test"))
 }
 

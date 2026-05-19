@@ -11,6 +11,7 @@ import io.ktor.websocket.Frame
 import io.ktor.websocket.WebSocketSession
 import io.ktor.websocket.readText
 import kotlinx.coroutines.channels.consumeEach
+import ru.nsi.seawar.shared.BOARD_SIZE
 import ru.nsi.seawar.shared.Cell
 import ru.nsi.seawar.shared.CellState
 import ru.nsi.seawar.shared.ClientMessage
@@ -37,8 +38,8 @@ fun Application.module() {
 
 private class SeaWarServer {
     private val players = ConcurrentHashMap<String, PlayerSession>()
+    private val matchLock = Any()
     private val queue = ArrayDeque<PlayerSession>()
-    private var currentGame: GameRoom? = null
     private val idSequence = AtomicInteger(1)
 
     companion object {
@@ -79,30 +80,54 @@ private class SeaWarServer {
     }
 
     private suspend fun enqueueAndMatch(player: PlayerSession) {
-        if (player.ready) return
-        if (player !in queue) {
-            queue.addLast(player)
-        }
-        player.send(ServerMessage.RoomWaiting("Ожидание второго игрока..."))
-
-        if (queue.size >= 2 && currentGame == null) {
-            val first = queue.removeFirst()
-            val second = queue.removeFirst()
-            currentGame = GameRoom(first, second).also { room ->
+        var waitingMessage: String? = null
+        var match: Pair<PlayerSession, PlayerSession>? = null
+        synchronized(matchLock) {
+            if (player.room != null) return
+            if (player !in queue) {
+                queue.addLast(player)
+            }
+            if (queue.size >= 2) {
+                val first = queue.removeFirst()
+                val second = queue.removeFirst()
+                val room = GameRoom(first, second)
                 first.room = room
                 second.room = room
-                first.send(ServerMessage.GameReady(yourTurn = true, opponentName = second.name))
-                second.send(ServerMessage.GameReady(yourTurn = false, opponentName = first.name))
+                match = first to second
+            } else {
+                waitingMessage = "Ожидание второго игрока..."
+            }
+        }
+
+        waitingMessage?.let { player.send(ServerMessage.RoomWaiting(it)) }
+
+        match?.let { (first, second) ->
+            first.send(ServerMessage.GameReady(yourTurn = true, opponentName = second.name))
+            second.send(ServerMessage.GameReady(yourTurn = false, opponentName = first.name))
+            if (first.ready && second.ready) {
                 first.sendState()
                 second.sendState()
+            } else {
+                if (!first.ready) {
+                    first.send(ServerMessage.RoomWaiting("Соперник найден. Расставьте флот."))
+                } else {
+                    first.send(ServerMessage.RoomWaiting("Ожидаем, пока соперник расставит флот."))
+                }
+                if (!second.ready) {
+                    second.send(ServerMessage.RoomWaiting("Соперник найден. Расставьте флот."))
+                } else {
+                    second.send(ServerMessage.RoomWaiting("Ожидаем, пока соперник расставит флот."))
+                }
             }
         }
     }
 
     private suspend fun handleFleetPlacement(player: PlayerSession?, message: ClientMessage.PlaceFleet) {
         val currentPlayer = player ?: return
-        currentPlayer.room ?: return
-        if (currentPlayer.ready) return
+        if (currentPlayer.ready) {
+            currentPlayer.send(ServerMessage.Error("Флот уже отправлен"))
+            return
+        }
 
         val fleet = validateFleet(message.ships).getOrElse {
             currentPlayer.send(ServerMessage.Error(it.message ?: "Неверная расстановка"))
@@ -114,9 +139,12 @@ private class SeaWarServer {
         currentPlayer.send(ServerMessage.RoomWaiting("Флот принят. Ждем соперника..."))
 
         val room = currentPlayer.room ?: return
-        if (room.left.ready && room.right.ready) {
+        val opponent = room.opponentOf(currentPlayer) ?: return
+        if (opponent.ready) {
             room.left.sendState()
             room.right.sendState()
+        } else {
+            opponent.send(ServerMessage.RoomWaiting("Соперник расставил флот. Расставьте свой."))
         }
     }
 
@@ -134,7 +162,7 @@ private class SeaWarServer {
         }
         if (room.over) return
 
-        if (cell.x !in 0 until 10 || cell.y !in 0 until 10) {
+        if (cell.x !in 0 until BOARD_SIZE || cell.y !in 0 until BOARD_SIZE) {
             currentPlayer.send(ServerMessage.Error("Клетка вне поля"))
             return
         }
@@ -163,14 +191,13 @@ private class SeaWarServer {
 
     private suspend fun removePlayer(player: PlayerSession) {
         players.remove(player.id)
-        queue.remove(player)
+        synchronized(matchLock) {
+            queue.remove(player)
+        }
         val room = player.room ?: return
         room.over = true
         room.other(player)?.send(ServerMessage.Error("Соперник отключился"))
         room.other(player)?.sendState(winner = room.other(player)?.name)
-        if (currentGame == room) {
-            currentGame = null
-        }
     }
 
     private suspend fun PlayerSession.send(message: ServerMessage) {
