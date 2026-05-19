@@ -1,0 +1,247 @@
+package ru.nsi.seawar.server
+
+import io.ktor.server.application.Application
+import io.ktor.server.application.install
+import io.ktor.server.engine.embeddedServer
+import io.ktor.server.netty.Netty
+import io.ktor.server.routing.routing
+import io.ktor.server.websocket.WebSockets
+import io.ktor.server.websocket.webSocket
+import io.ktor.websocket.Frame
+import io.ktor.websocket.WebSocketSession
+import io.ktor.websocket.readText
+import kotlinx.coroutines.channels.consumeEach
+import ru.nsi.seawar.shared.Cell
+import ru.nsi.seawar.shared.CellState
+import ru.nsi.seawar.shared.ClientMessage
+import ru.nsi.seawar.shared.ServerMessage
+import ru.nsi.seawar.shared.createBoardView
+import ru.nsi.seawar.shared.decodeClientMessage
+import ru.nsi.seawar.shared.encodeServerMessage
+import ru.nsi.seawar.shared.validateFleet
+import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.atomic.AtomicInteger
+
+fun main() {
+    embeddedServer(Netty, port = 8080, host = "0.0.0.0", module = Application::module).start(wait = true)
+}
+
+fun Application.module() {
+    install(WebSockets)
+    routing {
+        webSocket("/ws") {
+            SeaWarServer.handleSession(this)
+        }
+    }
+}
+
+private class SeaWarServer {
+    private val players = ConcurrentHashMap<String, PlayerSession>()
+    private val queue = ArrayDeque<PlayerSession>()
+    private var currentGame: GameRoom? = null
+    private val idSequence = AtomicInteger(1)
+
+    companion object {
+        private val singleton = SeaWarServer()
+
+        suspend fun handleSession(session: WebSocketSession) {
+            singleton.handle(session)
+        }
+    }
+
+    private suspend fun handle(session: WebSocketSession) {
+        var player: PlayerSession? = null
+        try {
+            session.incoming.consumeEach { frame ->
+                if (frame is Frame.Text) {
+                    val message = decodeClientMessage(frame.readText())
+                    when (message) {
+                        is ClientMessage.Join -> {
+                            if (player != null) return@consumeEach
+                            val assignedId = "player-${idSequence.getAndIncrement()}"
+                            player = PlayerSession(
+                                id = assignedId,
+                                name = message.name.ifBlank { "Игрок $assignedId" },
+                                session = session,
+                            ).also { players[it.id] = it }
+                            session.sendEncoded(ServerMessage.Welcome(player!!.id))
+                            enqueueAndMatch(player!!)
+                        }
+
+                        is ClientMessage.PlaceFleet -> handleFleetPlacement(player, message)
+                        is ClientMessage.Attack -> handleAttack(player, message.cell)
+                    }
+                }
+            }
+        } finally {
+            player?.let { removePlayer(it) }
+        }
+    }
+
+    private suspend fun enqueueAndMatch(player: PlayerSession) {
+        if (player.ready) return
+        if (player !in queue) {
+            queue.addLast(player)
+        }
+        player.send(ServerMessage.RoomWaiting("Ожидание второго игрока..."))
+
+        if (queue.size >= 2 && currentGame == null) {
+            val first = queue.removeFirst()
+            val second = queue.removeFirst()
+            currentGame = GameRoom(first, second).also { room ->
+                first.room = room
+                second.room = room
+                first.send(ServerMessage.GameReady(yourTurn = true, opponentName = second.name))
+                second.send(ServerMessage.GameReady(yourTurn = false, opponentName = first.name))
+                first.sendState()
+                second.sendState()
+            }
+        }
+    }
+
+    private suspend fun handleFleetPlacement(player: PlayerSession?, message: ClientMessage.PlaceFleet) {
+        val currentPlayer = player ?: return
+        currentPlayer.room ?: return
+        if (currentPlayer.ready) return
+
+        val fleet = validateFleet(message.ships).getOrElse {
+            currentPlayer.send(ServerMessage.Error(it.message ?: "Неверная расстановка"))
+            return
+        }
+
+        currentPlayer.shipCells = fleet
+        currentPlayer.ready = true
+        currentPlayer.send(ServerMessage.RoomWaiting("Флот принят. Ждем соперника..."))
+
+        val room = currentPlayer.room ?: return
+        if (room.left.ready && room.right.ready) {
+            room.left.sendState()
+            room.right.sendState()
+        }
+    }
+
+    private suspend fun handleAttack(player: PlayerSession?, cell: Cell) {
+        val currentPlayer = player ?: return
+        val room = currentPlayer.room ?: return
+        val opponent = room.opponentOf(currentPlayer) ?: return
+        if (!room.isYourTurn(currentPlayer)) {
+            currentPlayer.send(ServerMessage.Error("Сейчас не ваш ход"))
+            return
+        }
+        if (!currentPlayer.ready || !opponent.ready) {
+            currentPlayer.send(ServerMessage.Error("Оба игрока должны расставить флот"))
+            return
+        }
+        if (room.over) return
+
+        if (cell.x !in 0 until 10 || cell.y !in 0 until 10) {
+            currentPlayer.send(ServerMessage.Error("Клетка вне поля"))
+            return
+        }
+
+        if (room.shotsBy(currentPlayer).containsKey(cell)) {
+            currentPlayer.send(ServerMessage.Error("Клетка уже простреляна"))
+            return
+        }
+
+        val hit = cell in opponent.shipCells
+        room.recordShot(currentPlayer, cell, if (hit) CellState.Hit else CellState.Miss)
+        if (!hit) {
+            room.switchTurn()
+        }
+
+        if (opponent.shipCells.all { room.shotsBy(currentPlayer)[it] == CellState.Hit }) {
+            room.over = true
+            currentPlayer.sendState(winner = currentPlayer.name)
+            opponent.sendState(winner = currentPlayer.name)
+            return
+        }
+
+        currentPlayer.sendState()
+        opponent.sendState()
+    }
+
+    private suspend fun removePlayer(player: PlayerSession) {
+        players.remove(player.id)
+        queue.remove(player)
+        val room = player.room ?: return
+        room.over = true
+        room.other(player)?.send(ServerMessage.Error("Соперник отключился"))
+        room.other(player)?.sendState(winner = room.other(player)?.name)
+        if (currentGame == room) {
+            currentGame = null
+        }
+    }
+
+    private suspend fun PlayerSession.send(message: ServerMessage) {
+        session.sendEncoded(message)
+    }
+
+    private suspend fun PlayerSession.sendState(winner: String? = null) {
+        val room = room ?: return
+        val opponent = room.opponentOf(this) ?: return
+        val yourShots = room.shotsBy(this)
+        val enemyShots = room.shotsBy(opponent)
+        val yourView = createBoardView(shipCells, enemyShots, revealShips = true)
+        val enemyView = createBoardView(opponent.shipCells, yourShots, revealShips = false)
+        send(
+            ServerMessage.State(
+                yourBoard = yourView,
+                enemyBoard = enemyView,
+                status = when {
+                    winner != null -> if (winner == name) "Вы победили" else "Вы проиграли"
+                    room.over -> "Игра завершена"
+                    room.isYourTurn(this) -> "Ваш ход"
+                    else -> "Ход соперника"
+                },
+                yourTurn = room.isYourTurn(this),
+                winner = winner,
+            )
+        )
+    }
+}
+
+private data class PlayerSession(
+    val id: String,
+    val name: String,
+    val session: WebSocketSession,
+) {
+    var room: GameRoom? = null
+    var ready: Boolean = false
+    var shipCells: Set<Cell> = emptySet()
+}
+
+private class GameRoom(val left: PlayerSession, val right: PlayerSession) {
+    private val shots = ConcurrentHashMap<String, MutableMap<Cell, CellState>>()
+    private var turnId: String = left.id
+    var over: Boolean = false
+
+    init {
+        shots[left.id] = ConcurrentHashMap()
+        shots[right.id] = ConcurrentHashMap()
+    }
+
+    fun opponentOf(player: PlayerSession): PlayerSession? = when (player.id) {
+        left.id -> right
+        right.id -> left
+        else -> null
+    }
+
+    fun other(player: PlayerSession): PlayerSession? = opponentOf(player)
+
+    fun isYourTurn(player: PlayerSession): Boolean = turnId == player.id
+
+    fun switchTurn() {
+        turnId = if (turnId == left.id) right.id else left.id
+    }
+
+    fun shotsBy(player: PlayerSession): MutableMap<Cell, CellState> = shots[player.id] ?: mutableMapOf()
+
+    fun recordShot(player: PlayerSession, cell: Cell, state: CellState) {
+        shotsBy(player)[cell] = state
+    }
+}
+
+private suspend fun WebSocketSession.sendEncoded(message: ServerMessage) {
+    send(Frame.Text(encodeServerMessage(message)))
+}
