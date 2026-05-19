@@ -1,6 +1,8 @@
 plugins {
     kotlin("jvm") version "2.2.0" apply false
     kotlin("plugin.serialization") version "2.2.0" apply false
+    kotlin("plugin.compose") version "2.2.0" apply false
+    id("org.jetbrains.compose") version "1.8.0" apply false
 }
 
 import org.gradle.api.plugins.JavaPluginExtension
@@ -13,6 +15,8 @@ allprojects {
 
     repositories {
         mavenCentral()
+        maven("https://maven.pkg.jetbrains.space/public/p/compose/dev")
+        google()
     }
 }
 
