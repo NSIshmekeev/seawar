@@ -36,11 +36,16 @@ data class ShipDefinition(
 )
 
 val defaultFleet = listOf(
-    ShipDefinition(5),
     ShipDefinition(4),
     ShipDefinition(3),
     ShipDefinition(3),
     ShipDefinition(2),
+    ShipDefinition(2),
+    ShipDefinition(2),
+    ShipDefinition(1),
+    ShipDefinition(1),
+    ShipDefinition(1),
+    ShipDefinition(1),
 )
 
 @Serializable
