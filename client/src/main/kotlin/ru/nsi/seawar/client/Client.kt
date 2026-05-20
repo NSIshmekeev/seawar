@@ -584,7 +584,13 @@ private fun ControlPanel(
                 label = { Text("Адрес сервера") },
                 modifier = Modifier.fillMaxWidth()
             )
-            Spacer(modifier = Modifier.height(8.dp))
+            Text(
+                text = "Для игры по сети замените localhost на IP-адрес хоста (пример: ws://192.168.1.5:8080/ws). IP хоста отображается в консоли сервера.",
+                fontFamily = SeaWarTheme.bodyFont,
+                fontSize = 11.sp,
+                color = SeaWarTheme.textMuted
+            )
+            Spacer(modifier = Modifier.height(4.dp))
             OutlinedTextField(
                 value = playerName,
                 onValueChange = onPlayerNameChange,

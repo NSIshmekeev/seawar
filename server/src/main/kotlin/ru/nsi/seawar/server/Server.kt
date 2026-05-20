@@ -24,7 +24,36 @@ import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.atomic.AtomicInteger
 
 fun main() {
+    printNetworkAddresses()
     embeddedServer(Netty, port = 8080, host = "0.0.0.0", module = Application::module).start(wait = true)
+}
+
+private fun printNetworkAddresses() {
+    println("=".repeat(50))
+    println("  SeaWar — Сервер запущен на порту 8080")
+    println("=".repeat(50))
+    try {
+        val addresses = java.net.NetworkInterface.getNetworkInterfaces()
+            ?.asSequence()
+            ?.filter { it.isUp && !it.isLoopback }
+            ?.flatMap { it.inetAddresses.asSequence() }
+            ?.filterIsInstance<java.net.Inet4Address>()
+            ?.map { it.hostAddress }
+            ?.toList()
+            ?: emptyList()
+        if (addresses.isEmpty()) {
+            println("  Адрес в сети: не найден (только localhost)")
+            println("  URL для подключения: ws://localhost:8080/ws")
+        } else {
+            println("  Передайте второму игроку один из этих адресов:")
+            addresses.forEach { ip ->
+                println("  --> ws://$ip:8080/ws")
+            }
+        }
+    } catch (_: Exception) {
+        println("  URL: ws://localhost:8080/ws")
+    }
+    println("=".repeat(50))
 }
 
 fun Application.module() {
